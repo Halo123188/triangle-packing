@@ -2,9 +2,11 @@ import json
 import os.path
 import time
 from datetime import datetime
+from cost_functions import transform_vertices_2d, boundary_cost, overlap_cost_all
 
 import rerun as rr
 import torch
+import numpy
 
 assets_dir = os.path.join(os.path.dirname(__file__), "assets")
 
@@ -86,17 +88,21 @@ def get_goal_aabb(env: dict) -> torch.Tensor:
     return goal_aabb
 
 
+
 def optimize(
     num_triangles: int,
     env_idx: int,
     num_particles: int,
     visualize: bool = True,
-    device: str = "cuda",
+    device: str = "cpu",
 ) -> float:
     """
     Solve the triangle packing problem. Returns the time required to find a satisfying particle.
     """
     env = load_env(num_triangles, env_idx)
+    max_steps = 2000
+    lr = 0.1
+    tolerance = 1e-5
 
     if visualize:
         recording_id = datetime.now().isoformat().split(".")[0]
@@ -120,36 +126,62 @@ def optimize(
         xy = xy * (goal_aabb[1] - goal_aabb[0]) + goal_aabb[0]
         rot = torch.rand(num_particles, 1, device=device) * 2 * torch.pi
         xy_rot = torch.cat((xy, rot), dim=1)
+        xy_rot.requires_grad_(True)
         particles[triangle] = xy_rot
-        print(f"Triangle {triangle} particles shape: {xy_rot.shape}")
+    
+    param_list = [particles[t] for t in particles] # a list of 3 tensor (512, 3)
+    optimizer = torch.optim.Adam(param_list, lr=lr)
+
 
     # Your code starts here. Feel free to write any additional methods you need.
     # You should track the time required to find a satisfying particle along with other metrics you think are relevant
     start_time = time.perf_counter()
 
-    for _ in range(1):
-        found_solution = False
-        if found_solution:
-            torch.cuda.synchronize()
+    for step in range(max_steps):
+        print(step, '-' * 10)
+        optimizer.zero_grad()
+        total_cost = torch.zeros(num_particles, device = device)
+
+        for tlabel, local_verts in triangles.items():
+            xy_rot = particles[tlabel]
+            global_verts = transform_vertices_2d(local_verts, xy_rot) # shape (512, 3, 2)
+            cost_in = boundary_cost(global_verts, goal_aabb)
+            total_cost += cost_in
+        
+        # overlap_c = overlap_cost_all(triangles, particles)
+        # total_cost += overlap_c
+
+        mean_cost = total_cost.mean()
+        mean_cost.backward()
+        optimizer.step()
+
+        min_cost_val, min_idx = total_cost.min(dim=0)
+        print("Result_cost: ", min_cost_val.item())
+        if min_cost_val.item() < tolerance:
             time_to_solution = time.perf_counter() - start_time
-            return time_to_solution
 
         # Incomplete implementation for visualizing a particle. Might be helpful for debugging.
-        if visualize:
-            best_idx = 0
-            for triangle, vertices in triangles.items():
-                xy_rot = particles[triangle][best_idx].detach().clone()
-                # TODO: transform the triangle vertices by the rotation and xy translation
-                vertices_3d = torch.cat(
-                    (vertices, torch.zeros_like(vertices[:, :1])), dim=1
-                )
-                vertices_3d += 0.25  # offset for sake of this demo
-                rr.log(
-                    f"world/{triangle}",
-                    rr.Mesh3D(
-                        vertex_positions=vertices_3d.cpu(), triangle_indices=[[0, 1, 2]]
-                    ),
-                )
+            if visualize:
+                best_idx = min_idx
+                for triangle, vertices in triangles.items():
+                    xy_rot_best = particles[triangle][best_idx].detach().clone()
+                    # TODO: transform the triangle vertices by the rotation and xy translation
+                    global_verts_best = transform_vertices_2d(vertices, xy_rot_best.unsqueeze(0))
+                    v2d = global_verts_best[0]
+
+                    print("Result_pos: ", v2d)
+
+                    vertices_3d = torch.cat(
+                        (v2d, torch.zeros_like(v2d[:, :1])), dim=1
+                    )
+                    #vertices_3d += 0.25  # offset for sake of this demo
+                    rr.log(
+                        f"world/{triangle}",
+                        rr.Mesh3D(
+                            vertex_positions=vertices_3d.cpu().tolist(), triangle_indices=[[0, 1, 2]]
+                        ),
+                    )
+            return time_to_solution
 
     # No solution found
     return float("inf")
@@ -157,5 +189,5 @@ def optimize(
 
 if __name__ == "__main__":
     # Use device="cpu" if you don't have a GPU
-    duration = optimize(num_triangles=3, env_idx=0, num_particles=512, device="cuda")
+    duration = optimize(num_triangles=3, env_idx=0, num_particles=512, device="cpu")
     print("Time to solution:", duration)
