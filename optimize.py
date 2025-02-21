@@ -2,7 +2,8 @@ import json
 import os.path
 import time
 from datetime import datetime
-from cost_functions import transform_vertices_2d, boundary_cost, overlap_cost_all
+from cost_functions import transform_vertices_2d, boundary_cost, overlap_cost_all, ensure_ccw, compactness_cost
+from check_valid import constraints_satisfied
 
 import rerun as rr
 import torch
@@ -100,9 +101,12 @@ def optimize(
     Solve the triangle packing problem. Returns the time required to find a satisfying particle.
     """
     env = load_env(num_triangles, env_idx)
-    max_steps = 2000
+    max_steps = 500
     lr = 0.1
-    tolerance = 1e-5
+    tolerance = 1e-3
+    boundary_weight = 1.0
+    compactness_weight = 0.0
+    collision_weight = 1.0
 
     if visualize:
         recording_id = datetime.now().isoformat().split(".")[0]
@@ -140,48 +144,79 @@ def optimize(
     for step in range(max_steps):
         print(step, '-' * 10)
         optimizer.zero_grad()
-        total_cost = torch.zeros(num_particles, device = device)
+        total_cost = torch.zeros(num_particles, device=device)
 
+
+        # Process each triangle
         for tlabel, local_verts in triangles.items():
             xy_rot = particles[tlabel]
-            global_verts = transform_vertices_2d(local_verts, xy_rot) # shape (512, 3, 2)
+            global_verts = transform_vertices_2d(local_verts, xy_rot)  # shape (512, 3, 2)
+
+            # Boundary cost
             cost_in = boundary_cost(global_verts, goal_aabb)
-            total_cost += cost_in
-        
-        # overlap_c = overlap_cost_all(triangles, particles)
-        # total_cost += overlap_c
+            total_cost += cost_in * boundary_weight
+            assert (cost_in >= 0).all().item(), "Some elements in cost_in are not greater than 0"
+
+            # Compactness cost
+            compact_cost = compactness_cost(global_verts, goal_aabb)
+            total_cost += compact_cost * compactness_weight
+            assert (compact_cost >= 0).all().item(), "Some elements in compact_cost are not greater than 0"
+
+            # # Area coverage cost
+            # area_cost = area_coverage_cost(global_verts, goal_aabb)
+            # total_cost += area_cost * area_weight
+            # assert (area_cost >= 0).all().item(), "Some elements in area_cost are not greater than 0"
+
+        # Overlap cost
+        overlap_c = overlap_cost_all(triangles, particles)
+        assert (overlap_c >= 0).all().item(), "Some elements in overlap_c are not greater than 0"
+        total_cost += overlap_c * collision_weight
 
         mean_cost = total_cost.mean()
         mean_cost.backward()
         optimizer.step()
 
         min_cost_val, min_idx = total_cost.min(dim=0)
+        # for tlabel, local_verts in triangles.items():
+        #     print("Gradients:", particles[tlabel].grad)
         print("Result_cost: ", min_cost_val.item())
+        print("Overlap_c: ", overlap_c[min_idx])
+
+        if visualize:
+            best_idx = min_idx
+            for triangle, vertices in triangles.items():
+                xy_rot_best = particles[triangle][best_idx].detach().clone()
+                # TODO: transform the triangle vertices by the rotation and xy translation
+                global_verts_best = transform_vertices_2d(vertices, xy_rot_best.unsqueeze(0))
+                v2d = global_verts_best[0]
+
+                print("Result_pos: ", v2d)
+
+                vertices_3d = torch.cat(
+                    (v2d, torch.zeros_like(v2d[:, :1])), dim=1
+                )
+                        #vertices_3d += 0.25  # offset for sake of this demo
+                rr.log(
+                    f"world/{triangle}",
+                    rr.Mesh3D(
+                        vertex_positions=vertices_3d.cpu().tolist(), triangle_indices=[[0, 1, 2]]
+                    ),
+                )
+        
         if min_cost_val.item() < tolerance:
-            time_to_solution = time.perf_counter() - start_time
+            transformed_triangles = {}
+            for label, vertices in triangles.items():
+                xy_rot_best = particles[label][min_idx].detach().clone()
+                global_verts_best = transform_vertices_2d(vertices, xy_rot_best.unsqueeze(0))  # (1, 3, 2)
+                transformed_triangles[label] = global_verts_best[0]  # (3, 2)
 
-        # Incomplete implementation for visualizing a particle. Might be helpful for debugging.
-            if visualize:
-                best_idx = min_idx
-                for triangle, vertices in triangles.items():
-                    xy_rot_best = particles[triangle][best_idx].detach().clone()
-                    # TODO: transform the triangle vertices by the rotation and xy translation
-                    global_verts_best = transform_vertices_2d(vertices, xy_rot_best.unsqueeze(0))
-                    v2d = global_verts_best[0]
-
-                    print("Result_pos: ", v2d)
-
-                    vertices_3d = torch.cat(
-                        (v2d, torch.zeros_like(v2d[:, :1])), dim=1
-                    )
-                    #vertices_3d += 0.25  # offset for sake of this demo
-                    rr.log(
-                        f"world/{triangle}",
-                        rr.Mesh3D(
-                            vertex_positions=vertices_3d.cpu().tolist(), triangle_indices=[[0, 1, 2]]
-                        ),
-                    )
-            return time_to_solution
+        # Check that the constraints are satisfied for this candidate.
+            if constraints_satisfied(transformed_triangles, goal_aabb, tol=1e-3):
+                time_to_solution = time.perf_counter() - start_time
+                print("All consitions satisfied")
+                return time_to_solution
+            else:
+                print("Candidate solution does not satisfy constraints.")
 
     # No solution found
     return float("inf")
